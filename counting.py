@@ -20,7 +20,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--initial-checkpoint', default='', type=str, metavar='PATH', help='Initialize model from this checkpoint (default: none)')
 parser.add_argument('--binarizable', type=str, default='T', help='Using binary (B) or ternary (T)')
 parser.add_argument('--amp', action='store_true', default=False, help='use NVIDIA amp for mixed precision training')
-#parser.add_argument('--sync-bn', action='store_true', help='enabling apex sync BN.')
 parser.add_argument('--opt-level', type=str, default='O1', help='Apex opt-level, "01"(conservative), "03"(Pure FP16)')
 
 
@@ -94,9 +93,7 @@ def count_hook(model):
         # For nn.Conv2d:    d is the quantization denominator for non-ternary/binary weights and operations
         #                   bd is the quantization denominator for ternary/binary weights and operations
         # For other modules: d is the quantization denominator for all the weights and operations
-
-        # For 32-bit full precision:    d==1
-        # For 16-bit half precision:    d==2
+        # Note that the additions inside GEMM are considered FP32 additions
         d = get_denominator(m, input, output)
 
 
@@ -183,17 +180,16 @@ def count_hook(model):
             # For depthwise convolution:                c_in==1
             local_flop_mults += (k * k * c_in) * (1-sparsity) * np.prod(output.size()) / bd
 
-            # Number of full or half precision (32-bit/16-bit) addition in convolution
-            # For 32-bit full precision:    d==1
-            # For 16-bit half precision:    d==2
-            local_flop_adds += (k * k * c_in * (1-sparsity) - 1) * np.prod(output.size()) / d
+            # Number of full precision (32-bit) addition in convolution
+            local_flop_adds += (k * k * c_in * (1-sparsity) - 1) * np.prod(output.size())
 
             # The parameters and additions for the bias
-            # For 32-bit full precision:    d==1
-            # For 16-bit half precision:    d==2
+            # For 32-bit full precision parameters:    d==1
+            # For 16-bit half precision parameters:    d==2
+            # Note that additions are in 32-bit full precision
             if m.bias is not None:
                 local_param_count += c_out / d
-                local_flop_adds += np.prod(output.size()) / d
+                local_flop_adds += np.prod(output.size())
 
             # Adding the local counting to the global counting
             param_count += local_param_count
@@ -206,7 +202,7 @@ def count_hook(model):
             c_out, c_in = m.weight.size()
             local_param_count += c_in * c_out / d
             local_flop_mults += c_in * np.prod(output.size()) / d
-            local_flop_adds += (c_in - 1) * np.prod(output.size()) / d
+            local_flop_adds += (c_in - 1) * np.prod(output.size())
 
             param_count += local_param_count
             flop_mults += local_flop_mults
@@ -214,7 +210,6 @@ def count_hook(model):
             module_statistics[id(m)] = (m, [local_param_count, local_flop_adds, local_flop_mults])
 
         elif isinstance(m, nn.BatchNorm2d):
-            # Is the conv-layers quantized to FP16?
             using_FP16_for_conv = args.amp and args.opt_level != 'O0'
             if d == 1 and using_FP16_for_conv:
                 # BatchNorm2d is performed with FP32 precision as indicated by d==1
@@ -352,7 +347,7 @@ class ForwardSign(torch.autograd.Function):
             return (x_ternary.type(torch.cuda.FloatTensor), torch.tensor(multiplier).type(torch.cuda.FloatTensor))
     @staticmethod
     def backward(ctx, g):
-        pass
+        raise NotImplementedError("backward is only implemented at training time")
 
 def forward_binarizable(self, x):
     w, M = self._get_weight('weight')
@@ -409,12 +404,21 @@ with torch.no_grad():
     x = torch.randn([1, 3, 32, 32]).cuda()
     y = model(x)
 
-
+flops = flop_mults+flop_adds
+statistics_accumulations = {'Conv2d':[0,0,0],'BatchNorm2d':[0,0,0]}
 for k in module_statistics:
     m = module_statistics[k][0].__class__
     m = str(m).split('.')[-1][:-2]
     n_params, n_adds, n_mults = module_statistics[k][1]
-    print('Module {:25s} #params {:10.1f} \t #adds {:10.1f} \t #mults {:10.1f}'.format(m, n_params, n_adds, n_mults))
+    print('Module {:25s} #params {:10.1f}({:10.5f}) \t #adds {:10.1f}({:10.5f}) \t #mults {:10.1f}({:10.5f})'.format(m, n_params, n_params/param_count, n_adds, n_adds/flops, n_mults, n_mults/flops))
+    if m=='Conv2d':
+        print(module_statistics[k][0])
+    if m in statistics_accumulations:
+        statistics_accumulations[m][0] += n_params
+        statistics_accumulations[m][1] += n_adds
+        statistics_accumulations[m][2] += n_mults
+print(statistics_accumulations)
+
 
 
 print('\n============================================')

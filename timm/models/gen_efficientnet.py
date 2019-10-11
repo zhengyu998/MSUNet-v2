@@ -1794,17 +1794,6 @@ def _gen_MSUnet_CIFAR100(channel_multiplier=1.0, depth_multiplier=1.0, num_class
     Ref impl: https://github.com/tensorflow/tpu/tree/master/models/official/mnasnet/mixnet
     Paper: https://arxiv.org/abs/1907.09595
     """
-    # V3: using ternary
-    # alpha = 0.5*epoch/600, lr_step_sched=[200,100,100,...,100], label smoothing
-    # No dropout, No mix-up
-    # @ ('./output/train/20190915-160235-mixnet_CIFAR100-32/checkpoint-403.pth.tar', 78.89422352040822)
-    # v2:
-    # Target for binary network
-    # v1
-    #  @('./output/train/20190913-040007-mixnet_CIFAR100-32/checkpoint-327.pth.tar', 79.03419609504613)
-    # Flops 3.646E+08/1.049E+10 = 0.0348, Params 1.536E+06/3.650E+07 = 0.0421
-    # total score 0.0769
-
     stem_size = 64
     num_features = 256
     arch_def =[

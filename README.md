@@ -8,7 +8,7 @@ It exploits the power of mixed depthwise convolution, quantization and sparsific
 |Model | Top-1 Test Accuracy | #Flops | #Parameters| Score|
 |---|---|---|---|---|
 |[MSUNet-v1](https://github.com/zhengyu998/MSUNet)| 80.47%| 118.6 M| 0.2119 M|0.01711|
-|MSUNet-v2| 80.30% | 55.26 M | 0.1204 M | 0.00857|
+|MSUNet-v2| 80.30% | 97.01 M | 0.1204 M | 0.01255|
 
 
 We follow the training-and-pruning pipeline, where we first train a network with ternary weights and then prune the network to further sparsify the squeeze-excitation and dw-conv layers and quantize the weights to FP16 in the meantime.
@@ -38,7 +38,7 @@ In terms of implementation, we use pytorch to implement our model. Our repositor
     * We follow an approach similar to [Training wide residual networks for deployment using a single bit for each weight](https://arxiv.org/abs/1802.08530) to represent the ternary weights, that is, 
     ![eqn1](images/eqn1.gif) where *W* is the weight, *Ternary(W)* quantizes the weight to (-1,0,+1) and ![sqrtM](images/eqn2.gif) is a FP16 multiplier that scales all the weights in a particular convolutional layer. 
     
-    * The piece of code that reflects the ternary operation in `validate.py` is as below
+    * The code snippet that reflects the ternary operation in `validate.py` is as below
     ```python
     class ForwardSign(torch.autograd.Function):
     @staticmethod
@@ -57,13 +57,13 @@ In terms of implementation, we use pytorch to implement our model. Our repositor
     ```
     * As there is a scale factor ![sqrtM](images/eqn2.gif) for the weights and we are implementing fake quantization, we assume that the multiplicatin of scale factor ![sqrtM](images/eqn2.gif) is performed **after** convolving the input with ternary weights. 
     * Also note that as the ternary weights tend to be sparse in our implementation, we assume that they are compatible with sparse matrix storage and sparse math operation.
-    * Therefore, the overall flops is calculated from three parts: 1) sparse 1-bit (-1, 1) multiplication in the convolution operation; 2) sparse FP16 addition in the convolution operation; and 3) FP16 multiplication for multiplying the scale factor on the output of the layer.
+    * Therefore, the overall flops is calculated from three parts: 1) sparse 1-bit (-1, 1) multiplication in the convolution operation; 2) sparse FP32 addition in the convolution operation; and 3) FP16 multiplication for multiplying the scale factor on the output of the layer.
     * And the number of parameters is calculated from three parts: 1) 1-bit (-1,1) representation of the non-zero values in weights; 2) bitmask of the full weights; 3) an FP16 scale factor for each convolutional layer.
  
 * **Sparse Squeeze-excitation and dw-conv layers**
     * Same as [pytorch-image-models](https://github.com/rwightman/pytorch-image-models), we use 1x1 convolution performed on features with spatial dimension ![HxW](images/eqn3.gif) to perform squeeze-and-excitation, which is equivalent to the fully connected layer implementation.
     * In order to make the weights sparse, we perform pruning on the weights of squeeze-excitation layers and dw-conv layers.
-    * Therefore, the number of additions and multiplication comes from the sparse 1x1 conv or dw-conv.
+    * Therefore, the number of additions and multiplication comes from the sparse 1x1 conv or dw-conv, that is, 1) 16-bit multiplication, and 2) 32-bit addition.
     * And the number of parameters comes from two parts: 1) FP16 non-zeros values of the weights; 2) bitmask of the full weights.
 
 * **Mixed Precision**
@@ -74,13 +74,14 @@ In terms of implementation, we use pytorch to implement our model. Our repositor
 
 * **Scoring**
     * The flops and parameters are counted by their respective forward hooks.
-    * As stated previously, layers with ternary weights are counted as sparse 1-bit multiplications, sparse FP16 additions and sparse 1-bit sparse matrix storage. We include the following code in `counting.py` to calculate the sparsity, bit mask and quantization divider:
+    * As stated previously, layers with ternary weights are counted as sparse 1-bit multiplications, sparse 32-bit additions and sparse 1-bit matrix storage. We include the following code in `counting.py` to calculate the sparsity, bit mask and quantization divider:
     ```python
         # For nn.Conv2d:    d is the quantization denominator for non-ternary/binary weights and operations
         #                   bd is the quantization denominator for ternary/binary weights and operations
         
         # For 32-bit full precision:    d==1
         # For 16-bit half precision:    d==2
+        # Note that the additions inside GEMM are considered FP32 additions
         d = get_denominator(m, input, output)
 
         if isinstance(m, nn.Conv2d):
@@ -145,16 +146,16 @@ In terms of implementation, we use pytorch to implement our model. Our repositor
             local_flop_mults += (k * k * c_in) * (1-sparsity) * np.prod(output.size()) / bd
 
             # Number of full or half precision (32-bit/16-bit) addition in convolution
-            # For 32-bit full precision:    d==1
-            # For 16-bit half precision:    d==2
-            local_flop_adds += (k * k * c_in * (1-sparsity) - 1) * np.prod(output.size()) / d
+            # For 32-bit full precision addition
+            local_flop_adds += (k * k * c_in * (1-sparsity) - 1) * np.prod(output.size())
 
             # The parameters and additions for the bias
-            # For 32-bit full precision:    d==1
-            # For 16-bit half precision:    d==2
+            # For 32-bit full precision parameters:    d==1
+            # For 16-bit half precision parameters:    d==2
+            # Note that additions are in 32-bit full precision
             if m.bias is not None:
                 local_param_count += c_out / d
-                local_flop_adds += np.prod(output.size()) / d
+                local_flop_adds += np.prod(output.size())
 
     ```
     * The squeeze-excitation and dw-conv layers are also sparse, but we did not separate them from the normal convolution layers for implementation convenience. 
@@ -199,16 +200,16 @@ In terms of implementation, we use pytorch to implement our model. Our repositor
             local_flop_mults += (k * k * c_in) * (1-sparsity) * np.prod(output.size()) / bd
 
             # Number of full or half precision (32-bit/16-bit) addition in convolution
-            # For 32-bit full precision:    d==1
-            # For 16-bit half precision:    d==2
-            local_flop_adds += (k * k * c_in * (1-sparsity) - 1) * np.prod(output.size()) / d
+            # For 32-bit full precision addition
+            local_flop_adds += (k * k * c_in * (1-sparsity) - 1) * np.prod(output.size())
 
             # The parameters and additions for the bias
             # For 32-bit full precision:    d==1
             # For 16-bit half precision:    d==2
+            # Note that additions are in 32-bit full precision
             if m.bias is not None:
                 local_param_count += c_out / d
-                local_flop_adds += np.prod(output.size()) / d
+                local_flop_adds += np.prod(output.size())
 
     ```
     * Since the convolution and batch normalization are all performed with FP16 precision at test (inference) time, we can count the batch normalization as merged. 
@@ -241,6 +242,7 @@ In terms of implementation, we use pytorch to implement our model. Our repositor
             else:
                 raise RuntimeError("Unsupported quantization scheme for batchnorm")
     ```
+    
     
 
 ### Evaluation
